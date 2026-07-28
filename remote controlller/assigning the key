@@ -1,0 +1,132 @@
+#include <ESP8266WiFi.h>
+#include <espnow.h>
+#include <DHT.h>
+#include <Servo.h>
+
+// Motor Pins
+const int IN1 = D1;
+const int IN2 = D2;
+const int IN3 = D5;
+const int IN4 = D6;
+const int RELAY_PIN = D7;
+
+// Sensors
+const int MQ135_PIN = A0;
+#define DHTPIN D3
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+const int TRIG_PIN = D4;
+const int ECHO_PIN = D8;
+
+// Servo
+Servo myServo;
+int currentAngle = 90;
+const int SERVO_PIN = D0;
+
+unsigned long lastSensorSend = 0;
+
+enum Command {STOP, FORWARD, BACKWARD, LEFT, RIGHT, RELAY_ON, RELAY_OFF, SERVO_UP, SERVO_DOWN};
+
+void moveMotors(Command cmd) {
+  switch (cmd) {
+    case FORWARD:  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); break;
+    case BACKWARD: digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); break;
+    case LEFT:     digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); break;
+    case RIGHT:    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); break;
+    default:       digitalWrite(IN1, LOW); digitalWrite(IN2, LOW); digitalWrite(IN3, LOW); digitalWrite(IN4, LOW); break;
+  }
+}
+
+typedef struct {
+  int co;
+  int nh3;
+  int airQuality;
+  float temperature;
+  float humidity;
+  float distance;
+} SensorData;
+
+uint8_t broadcastAddress[] = {0xC8, 0x2B, 0x96, 0x1C, 0x39, 0x2C}; // Replace with your transmitter MAC
+
+void onReceive(uint8_t* mac, uint8_t* data, uint8_t len) {
+  if (len == sizeof(Command)) {
+    Command cmd;
+    memcpy(&cmd, data, sizeof(cmd));
+    Serial.print("Received command: "); Serial.println(cmd);
+
+    if (cmd == RELAY_ON) {
+      digitalWrite(RELAY_PIN, LOW);
+      Serial.println("Relay ON");
+    } else if (cmd == RELAY_OFF) {
+      digitalWrite(RELAY_PIN, HIGH);
+      Serial.println("Relay OFF");
+    } else if (cmd == SERVO_UP) {
+      if (currentAngle < 180) {
+        currentAngle += 15;
+        if (currentAngle > 180) currentAngle = 180;
+        myServo.write(currentAngle);
+        Serial.print("Servo Angle Increased to: "); Serial.println(currentAngle);
+      }
+    } else if (cmd == SERVO_DOWN) {
+      if (currentAngle > 0) {
+        currentAngle -= 15;
+        if (currentAngle < 0) currentAngle = 0;
+        myServo.write(currentAngle);
+        Serial.print("Servo Angle Decreased to: "); Serial.println(currentAngle);
+      }
+    } else {
+      moveMotors(cmd);
+    }
+  }
+}
+
+void sendSensorData() {
+  int mq135Val = analogRead(MQ135_PIN);
+  SensorData data;
+  data.co = mq135Val / 2;
+  data.nh3 = mq135Val / 3;
+  data.airQuality = mq135Val;
+  data.temperature = dht.readTemperature();
+  data.humidity = dht.readHumidity();
+
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 20000);
+  data.distance = (duration == 0) ? 999.0 : (duration * 0.034 / 2.0);
+
+  Serial.println("Sending sensor data...");
+  esp_now_send(broadcastAddress, (uint8_t*)&data, sizeof(data));
+}
+
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+  myServo.attach(SERVO_PIN);
+  myServo.write(currentAngle);
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(RELAY_PIN, OUTPUT); digitalWrite(RELAY_PIN, HIGH);
+  pinMode(TRIG_PIN, OUTPUT); pinMode(ECHO_PIN, INPUT);
+
+  WiFi.mode(WIFI_STA);
+  Serial.print("Receiver MAC: "); Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != 0) {
+    Serial.println("ESP-NOW init failed!");
+    return;
+  }
+
+  esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
+  esp_now_register_recv_cb(onReceive);
+  esp_now_add_peer(broadcastAddress, ESP_NOW_ROLE_COMBO, 1, NULL, 0);
+}
+
+void loop() {
+  if (millis() - lastSensorSend >= 2000) {
+    lastSensorSend = millis();
+    sendSensorData();
+  }
+}
